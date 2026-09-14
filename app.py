@@ -1,4 +1,5 @@
 from datetime import datetime, time, timezone
+import time as t_module
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -12,7 +13,7 @@ st.set_page_config(
 
 st.title("🌐 Oanda Market Session Opening Range (OR) Dashboard")
 st.markdown(
-    "Analyze Opening Range sizes, post-OR extension magnitudes, and reversion/breakout probabilities across global sessions."
+    "Analyze Opening Range sizes, post-OR extension magnitudes, and cross-session breakout vs. reversion probabilities."
 )
 
 # ---------------------------------------------------------
@@ -110,6 +111,8 @@ def fetch_oanda_m5_paginated(
 
             if len(candles) < 10:
                 break
+
+            t_module.sleep(0.2)
         except Exception:
             break
 
@@ -140,22 +143,46 @@ def fetch_oanda_m5_paginated(
 
 
 # ---------------------------------------------------------
-# SESSION PROCESSING LOGIC (WITH OUTCOME CLASSIFICATION)
+# SESSION PROCESSING LOGIC WITH PREVIOUS SESSION MAPPING
 # ---------------------------------------------------------
 def run_session_analysis(
-    df, or_start_h, or_start_m, or_dur_mins, sess_end_h, mult
+    raw_df, or_start_h, or_start_m, or_dur_mins, sess_end_h, mult, session_type
 ):
-    if df is None or df.empty:
+    if raw_df is None or raw_df.empty:
         return pd.DataFrame()
 
-    if df.index.tz is None:
-        df.index = pd.to_datetime(df.index, utc=True)
+    if raw_df.index.tz is None:
+        raw_df.index = pd.to_datetime(raw_df.index, utc=True)
     else:
-        df.index = df.index.tz_convert("UTC")
+        raw_df.index = raw_df.index.tz_convert("UTC")
 
-    df["Date"] = df.index.date
-    grouped = df.groupby("Date")
+    # Helper to get session high/low for a given window on a specific date
+    def get_session_bounds(df_full, d, start_h, end_h):
+        mask = (df_full.index.date == d) & (
+            df_full.index.time >= time(start_h, 0)
+        ) & (df_full.index.time <= time(end_h, 0))
+        sub = df_full[mask]
+        if sub.empty:
+            return None, None
+        return float(sub["High"].max()), float(sub["Low"].min())
 
+    raw_df["Date"] = raw_df.index.date
+    unique_dates = sorted(raw_df["Date"].unique())
+
+    # Pre-calculate standard session high/low for all dates to easily find "previous session"
+    session_extremes = {}
+    for d in unique_dates:
+        # Define standard block windows for Tokyo (0-8), London (8-16), NY (13-21)
+        t_h, t_l = get_session_bounds(raw_df, d, 0, 8)
+        l_h, l_l = get_session_bounds(raw_df, d, 8, 16)
+        n_h, n_l = get_session_bounds(raw_df, d, 13, 21)
+        session_extremes[d] = {
+            "Tokyo": (t_h, t_l),
+            "London": (l_h, l_l),
+            "NY": (n_h, n_l),
+        }
+
+    grouped = raw_df.groupby("Date")
     analysis_results = []
 
     or_start_time = time(or_start_h, or_start_m)
@@ -165,7 +192,7 @@ def run_session_analysis(
     or_end_time = time(end_h, end_m)
     session_end_t = time(sess_end_h, 0)
 
-    for date_val, day_df in grouped:
+    for i, (date_val, day_df) in enumerate(grouped):
         time_index = day_df.index.time
         or_mask = (time_index >= or_start_time) & (time_index < or_end_time)
         or_df = day_df[or_mask]
@@ -200,15 +227,29 @@ def run_session_analysis(
         close_price = float(sess_df["Close"].iloc[-1])
         dist_from_mid_close = abs(close_price - or_mid) * mult
 
-        # Classification logic for Breakout Success vs Reversion:
-        # Reversion = Session close ended up back inside the Opening Range boundaries
-        # Sustained Breakout = Session close ended outside the Opening Range boundaries
-        is_closed_inside = (close_price >= or_low) & (close_price <= or_high)
-        outcome_label = (
-            "Reversion (Closed Inside)"
-            if is_closed_inside
-            else "Sustained Breakout"
-        )
+        # Determine Previous Session High / Low
+        prev_h, prev_l = None, None
+        if session_type == "Tokyo":
+            if i > 0:
+                prev_date = unique_dates[i - 1]
+                prev_h, prev_l = session_extremes[prev_date]["NY"]
+        elif session_type == "London":
+            prev_h, prev_l = session_extremes[date_val]["Tokyo"]
+        elif session_type == "New York":
+            prev_h, prev_l = session_extremes[date_val]["London"]
+
+        # Reversion vs Sustained Breakout based on Previous Session High/Low
+        if prev_h is not None and prev_l is not None:
+            is_closed_back_in_prev = (close_price >= prev_l) & (
+                close_price <= prev_h
+            )
+            outcome_label = (
+                "Reversion (Closed in Prev Session)"
+                if is_closed_back_in_prev
+                else "Sustained Breakout"
+            )
+        else:
+            outcome_label = "Unclassified (No Prev Data)"
 
         analysis_results.append(
             {
@@ -251,7 +292,9 @@ else:
             ["🇯🇵 Tokyo Session", "🇬🇧 London Session", "🇺🇸 New York Session"]
         )
 
-        def render_session_tab(session_name, default_or_h, default_end_h):
+        def render_session_tab(
+            session_name, default_or_h, default_end_h, sess_type_str
+        ):
             st.subheader(f"{session_name} Session Analysis")
             col_s1, col_s2, col_s3 = st.columns(3)
             or_h = col_s1.selectbox(
@@ -274,7 +317,7 @@ else:
             )
 
             df_sess = run_session_analysis(
-                raw_df, or_h, 0, or_dur, end_h, mult
+                raw_df, or_h, 0, or_dur, end_h, mult, sess_type_str
             )
 
             if df_sess.empty:
@@ -305,7 +348,6 @@ else:
             c1, c2 = st.columns(2)
 
             with c1:
-                # Chart 1: Magnitude / Extension
                 fig_ext = px.box(
                     df_sess,
                     x="OR_Category",
@@ -319,7 +361,6 @@ else:
                 st.plotly_chart(fig_ext, use_container_width=True)
 
             with c2:
-                # Chart 2: Success Rate vs Reversion Rate (Normalized Percentage Bar Chart)
                 outcome_counts = (
                     df_sess.groupby(["OR_Category", "Session_Outcome"])
                     .size()
@@ -330,7 +371,9 @@ else:
                     .size()
                     .reset_index(name="Total")
                 )
-                outcome_counts = pd.merge(outcome_counts, total_per_cat, on="OR_Category")
+                outcome_counts = pd.merge(
+                    outcome_counts, total_per_cat, on="OR_Category"
+                )
                 outcome_counts["Percentage"] = (
                     outcome_counts["Count"] / outcome_counts["Total"]
                 ) * 100
@@ -346,13 +389,13 @@ else:
                         "Percentage": "Probability / Frequency (%)",
                         "Session_Outcome": "Session Close Outcome",
                     },
-                    title=f"Breakout Success vs. Reversion Rate ({session_name})",
+                    title=f"Breakout vs. Reversion Rate ({session_name})",
                 )
                 st.plotly_chart(fig_prob, use_container_width=True)
 
         with tab_tokyo:
-            render_session_tab("Tokyo", 0, 8)
+            render_session_tab("Tokyo", 0, 8, "Tokyo")
         with tab_london:
-            render_session_tab("London", 8, 16)
+            render_session_tab("London", 8, 16, "London")
         with tab_ny:
-            render_session_tab("New York", 13, 21)
+            render_session_tab("New York", 13, 21, "New York")
