@@ -7,12 +7,12 @@ import streamlit as st
 
 # Page Configuration
 st.set_page_config(
-    page_title="Oanda Opening Range (OR) Correlation Analyzer", layout="wide"
+    page_title="Oanda Session Opening Range (OR) Analyzer", layout="wide"
 )
 
-st.title("📊 Oanda Opening Range (OR) Statistical & Correlation Analyzer")
+st.title("🌐 Oanda Market Session Opening Range (OR) Dashboard")
 st.markdown(
-    "Analyze how opening range sizes correlate with session expansion, daily ranges, and price reversion tendencies."
+    "Analyze Opening Range sizes, session expansion correlations, and reversion tendencies separated by major global market sessions."
 )
 
 # ---------------------------------------------------------
@@ -28,7 +28,7 @@ except Exception:
 # ---------------------------------------------------------
 # SIDEBAR CONFIGURATION
 # ---------------------------------------------------------
-st.sidebar.header("⚙️ Oanda & Analysis Settings")
+st.sidebar.header("⚙️ Global Settings")
 
 env_index = 0 if secret_env == "Practice" else 1
 oanda_env = st.sidebar.selectbox("Environment", ["Practice", "Live"], index=env_index)
@@ -53,24 +53,6 @@ selected_label = st.sidebar.selectbox(
 )
 oanda_inst = instrument_options[selected_label]
 
-lookback_days = st.sidebar.slider(
-    "Historical Lookback (Days)", min_value=10, max_value=180, value=60, step=10
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("⏰ Opening Range (OR) & Session Times (UTC)")
-
-# Configure OR Time Range
-or_start_hour = st.sidebar.slider("OR Start Hour (UTC)", 0, 23, 7)
-or_start_minute = st.sidebar.selectbox("OR Start Minute", [0, 15, 30, 45], index=0)
-or_duration_mins = st.sidebar.selectbox(
-    "OR Duration (Minutes)", [15, 30, 60, 120], index=2
-)
-
-# Session Window for Tracking Extension/Reversion
-session_end_hour = st.sidebar.slider(
-    "Session End Hour (UTC)", or_start_hour, 23, 16
-)
 
 # Pip multiplier calculation helper
 def get_pip_multiplier(ticker):
@@ -87,7 +69,7 @@ def get_pip_multiplier(ticker):
 # DATA FETCHING FROM OANDA
 # ---------------------------------------------------------
 @st.cache_data(ttl=300)
-def fetch_m5_data(instrument, count=4000, token=None, env="Practice"):
+def fetch_m5_data(instrument, count=4500, token=None, env="Practice"):
     if not token:
         return None
     domain = (
@@ -99,7 +81,7 @@ def fetch_m5_data(instrument, count=4000, token=None, env="Practice"):
 
     try:
         response = requests.get(url, headers=headers, params=params)
-        if response.status_code == 250 or response.status_code == 200:
+        if response.status_code == 200:
             data = response.json()
             candles = data.get("candles", [])
             if not candles:
@@ -128,19 +110,20 @@ def fetch_m5_data(instrument, count=4000, token=None, env="Practice"):
 
 
 # ---------------------------------------------------------
-# PROCESSING & ANALYSIS LOGIC
+# SESSION PROCESSING LOGIC
 # ---------------------------------------------------------
-def run_opening_range_analysis(
-    df, or_start_h, or_start_m, or_dur, sess_end_h, mult
+def run_session_analysis(
+    df, or_start_h, or_start_m, or_dur_mins, sess_end_h, mult
 ):
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # Ensure UTC timezone alignment
     if df.index.tz is None:
-        df = df.tz_localize("UTC")
+        df = df.index.tz_localize("UTC") if hasattr(df.index, 'tz_localize') else df
+        # Safe timezone alignment
+        df.index = pd.to_datetime(df.index, utc=True)
     else:
-        df = df.tz_convert("UTC")
+        df.index = df.index.tz_convert("UTC")
 
     df["Date"] = df.index.date
     grouped = df.groupby("Date")
@@ -148,15 +131,13 @@ def run_opening_range_analysis(
     analysis_results = []
 
     or_start_time = time(or_start_h, or_start_m)
-    # Calculate OR end time
-    start_total_mins = or_start_h * 60 + or_start_m + or_dur
+    start_total_mins = or_start_h * 60 + or_start_m + or_dur_mins
     end_h = (start_total_mins // 60) % 24
     end_m = start_total_mins % 60
     or_end_time = time(end_h, end_m)
     session_end_t = time(sess_end_h, 0)
 
     for date_val, day_df in grouped:
-        # Filter Opening Range Window
         time_index = day_df.index.time
         or_mask = (time_index >= or_start_time) & (time_index < or_end_time)
         or_df = day_df[or_mask]
@@ -172,7 +153,7 @@ def run_opening_range_analysis(
         if or_size <= 0:
             continue
 
-        # Filter Post-OR / Session Window (from OR end to session end)
+        # Post-OR Session Window
         session_mask = (time_index >= or_end_time) & (time_index <= session_end_t)
         sess_df = day_df[session_mask]
 
@@ -185,34 +166,21 @@ def run_opening_range_analysis(
             max(session_high, or_high) - min(session_low, or_low)
         ) * mult
 
-        # Daily full range
-        daily_high = day_df["High"].max()
-        daily_low = day_df["Low"].min()
-        daily_range = (daily_high - daily_low) * mult
-
-        # Post-OR Extension & Reversion Metrics
-        # Max extension above OR High or below OR Low post-OR
-        max_up_extension = (
-            max(0, sess_df["High"].max() - or_high) * mult
-        )
-        max_down_extension = (
-            max(0, or_low - sess_df["Low"].min()) * mult
-        )
+        # Max Extension from OR boundaries
+        max_up_extension = max(0, sess_df["High"].max() - or_high) * mult
+        max_down_extension = max(0, or_low - sess_df["Low"].min()) * mult
         max_extension = max(max_up_extension, max_down_extension)
 
-        # Reversion metric: distance of session close from OR midpoint, or whether price reverted back inside OR after breaking out
         close_price = sess_df["Close"].iloc[-1]
-        distance_from_mid_at_close = abs(close_price - or_mid) * mult
+        dist_from_mid_close = abs(close_price - or_mid) * mult
 
         analysis_results.append(
             {
                 "Date": date_val,
                 "OR_Size": or_size,
                 "Session_Range": session_range,
-                "Daily_Range": daily_range,
                 "Max_Extension": max_extension,
-                "Dist_From_Mid_Close": distance_from_mid_at_close,
-                "Expanded_Far": max_extension > (1.5 * or_size),
+                "Dist_From_Mid_Close": dist_from_mid_close,
             }
         )
 
@@ -220,134 +188,241 @@ def run_opening_range_analysis(
 
 
 # ---------------------------------------------------------
-# DASHBOARD UI EXECUTION
+# RENDER DASHBOARD TABS
 # ---------------------------------------------------------
 if not api_token:
     st.warning(
-        "⚠️ Please add your `oanda_api_token` to your Streamlit Cloud Secrets or input it in the sidebar."
+        "⚠️ Please provide your `oanda_api_token` in Streamlit Cloud Secrets or the sidebar."
     )
 else:
-    with st.spinner(f"Fetching M5 data for {selected_label} from Oanda..."):
-        raw_df = fetch_m5_data(
-            oanda_inst, count=4500, token=api_token, env=oanda_env
-        )
+    with st.spinner(f"Fetching M5 data for {selected_label}..."):
+        raw_df = fetch_m5_data(oanda_inst, count=4500, token=api_token, env=oanda_env)
 
     if raw_df is None or raw_df.empty:
-        st.error(
-            "Failed to retrieve candle data from Oanda. Please verify your token and environment."
-        )
+        st.error("Failed to fetch Oanda candles. Check your credentials or token.")
     else:
         mult = get_pip_multiplier(oanda_inst)
         unit_label = "pips" if mult in [100, 10000] else "pts"
 
-        df_stats = run_opening_range_analysis(
-            raw_df,
-            or_start_hour,
-            or_start_minute,
-            or_duration_mins,
-            session_end_hour,
-            mult,
+        # Create Session Tabs
+        tab_tokyo, tab_london, tab_ny = st.tabs(
+            ["🇯🇵 Tokyo Session", "🇬🇧 London Session", "🇺🇸 New York Session"]
         )
 
-        if df_stats.empty:
-            st.warning(
-                "Not enough data matched the selected opening range and session filter criteria."
+        # =========================================================
+        # TOKYO SESSION TAB
+        # =========================================================
+        with tab_tokyo:
+            st.subheader("🇯🇵 Tokyo Session Analysis")
+            col_s1, col_s2, col_s3 = st.columns(3)
+            tokyo_or_h = col_s1.selectbox(
+                "Tokyo OR Start Hour (UTC)", list(range(0, 24)), index=0, key="t_h"
             )
-        else:
-            # Display Quick Summary Metrics
-            st.subheader(
-                f"📈 Statistical Breakdown ({len(df_stats)} Trading Days Analyzed)"
+            tokyo_dur = col_s2.selectbox(
+                "Tokyo OR Duration", [15, 30, 60, 120], index=2, key="t_d"
             )
-
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric(
-                f"Avg OR Size ({unit_label})", f"{df_stats['OR_Size'].mean():.1f}"
-            )
-            col2.metric(
-                f"Avg Session Range ({unit_label})",
-                f"{df_stats['Session_Range'].mean():.1f}",
-            )
-            col3.metric(
-                f"Avg Daily Range ({unit_label})",
-                f"{df_stats['Daily_Range'].mean():.1f}",
-            )
-            col4.metric(
-                "Avg Max Extension", f"{df_stats['Max_Extension'].mean():.1f}"
+            tokyo_end_h = col_s3.selectbox(
+                "Tokyo Session End Hour (UTC)",
+                list(range(0, 24)),
+                index=8,
+                key="t_e",
             )
 
-            st.markdown("---")
-
-            # --- PART 1: CORRELATION WITH SESSION & DAILY RANGE ---
-            st.subheader("1️⃣ Correlation: Opening Range Size vs. Session & Daily Range")
-
-            corr_session = df_stats["OR_Size"].corr(df_stats["Session_Range"])
-            corr_daily = df_stats["OR_Size"].corr(df_stats["Daily_Range"])
-
-            c1, c2 = st.columns(2)
-            c1.info(
-                f"**OR Size vs. Session Range Correlation:** `{corr_session:.2f}`"
-            )
-            c2.info(f"**OR Size vs. Daily Range Correlation:** `{corr_daily:.2f}`")
-
-            fig_scatter1 = px.scatter(
-                df_stats,
-                x="OR_Size",
-                y="Session_Range",
-                labels={
-                    "OR_Size": f"Opening Range Size ({unit_label})",
-                    "Session_Range": f"Session Range ({unit_label})",
-                },
-                title="Opening Range Size vs. Session Max Range",
-            )
-            st.plotly_chart(fig_scatter1, use_container_width=True)
-
-            st.markdown("---")
-
-            # --- PART 2: EXPANSION VS REVERSION TENDENCIES ---
-            st.subheader(
-                "2️⃣ Reversion vs. Extension Tendency Based on Opening Range Size"
-            )
-            st.markdown(
-                "Do larger opening ranges run far away, or do they mean-revert? We categorize days by **Small OR** vs **Large OR** (relative to median) to check post-OR behavior."
+            df_tokyo = run_session_analysis(
+                raw_df, tokyo_or_h, 0, tokyo_dur, tokyo_end_h, mult
             )
 
-            median_or = df_stats["OR_Size"].median()
-            df_stats["OR_Category"] = np.where(
-                df_stats["OR_Size"] <= median_or, "Small OR", "Large OR"
+            if df_tokyo.empty:
+                st.info(
+                    "No data matched the Tokyo session filters. Adjust hours or check timeframe."
+                )
+            else:
+                m1, m2, m3 = st.columns(3)
+                m1.metric(
+                    f"Avg OR Size ({unit_label})",
+                    f"{df_tokyo['OR_Size'].mean():.1f}",
+                )
+                m2.metric(
+                    f"Avg Session Range ({unit_label})",
+                    f"{df_tokyo['Session_Range'].mean():.1f}",
+                )
+                corr_t = df_tokyo["OR_Size"].corr(df_tokyo["Session_Range"])
+                m3.metric("OR Size vs Session Range Correlation", f"{corr_t:.2f}")
+
+                st.markdown("---")
+                c1, c2 = st.columns(2)
+                with c1:
+                    fig_t1 = px.scatter(
+                        df_tokyo,
+                        x="OR_Size",
+                        y="Session_Range",
+                        labels={
+                            "OR_Size": f"Tokyo OR Size ({unit_label})",
+                            "Session_Range": f"Tokyo Session Range ({unit_label})",
+                        },
+                        title="OR Size vs. Session Range (Tokyo)",
+                    )
+                    st.plotly_chart(fig_t1, use_container_width=True)
+                with c2:
+                    df_tokyo["OR_Category"] = np.where(
+                        df_tokyo["OR_Size"] <= df_tokyo["OR_Size"].median(),
+                        "Small OR",
+                        "Large OR",
+                    )
+                    fig_t2 = px.box(
+                        df_tokyo,
+                        x="OR_Category",
+                        y="Max_Extension",
+                        labels={
+                            "OR_Category": "Tokyo OR Classification",
+                            "Max_Extension": f"Post-OR Max Extension ({unit_label})",
+                        },
+                        title="Extension vs Reversion (Tokyo)",
+                    )
+                    st.plotly_chart(fig_t2, use_container_width=True)
+
+        # =========================================================
+        # LONDON SESSION TAB
+        # =========================================================
+        with tab_london:
+            st.subheader("🇬🇧 London Session Analysis")
+            col_l1, col_l2, col_l3 = st.columns(3)
+            london_or_h = col_l1.selectbox(
+                "London OR Start Hour (UTC)", list(range(0, 24)), index=8, key="l_h"
+            )
+            london_dur = col_l2.selectbox(
+                "London OR Duration", [15, 30, 60, 120], index=2, key="l_d"
+            )
+            london_end_h = col_l3.selectbox(
+                "London Session End Hour (UTC)",
+                list(range(0, 24)),
+                index=16,
+                key="l_e",
             )
 
-            grouped_cat = (
-                df_stats.groupby("OR_Category")[
-                    ["Max_Extension", "Dist_From_Mid_Close", "Session_Range"]
-                ]
-                .mean()
-                .reset_index()
+            df_london = run_session_analysis(
+                raw_df, london_or_h, 0, london_dur, london_end_h, mult
             )
 
-            st.dataframe(
-                grouped_cat.style.format(
-                    {
-                        "Max_Extension": "{:.1f}",
-                        "Dist_From_Mid_Close": "{:.1f}",
-                        "Session_Range": "{:.1f}",
-                    }
-                ),
-                use_container_width=True,
+            if df_london.empty:
+                st.info(
+                    "No data matched the London session filters. Adjust hours or check timeframe."
+                )
+            else:
+                m1, m2, m3 = st.columns(3)
+                m1.metric(
+                    f"Avg OR Size ({unit_label})",
+                    f"{df_london['OR_Size'].mean():.1f}",
+                )
+                m2.metric(
+                    f"Avg Session Range ({unit_label})",
+                    f"{df_london['Session_Range'].mean():.1f}",
+                )
+                corr_l = df_london["OR_Size"].corr(df_london["Session_Range"])
+                m3.metric("OR Size vs Session Range Correlation", f"{corr_l:.2f}")
+
+                st.markdown("---")
+                c1, c2 = st.columns(2)
+                with c1:
+                    fig_l1 = px.scatter(
+                        df_london,
+                        x="OR_Size",
+                        y="Session_Range",
+                        labels={
+                            "OR_Size": f"London OR Size ({unit_label})",
+                            "Session_Range": f"London Session Range ({unit_label})",
+                        },
+                        title="OR Size vs. Session Range (London)",
+                    )
+                    st.plotly_chart(fig_l1, use_container_width=True)
+                with c2:
+                    df_london["OR_Category"] = np.where(
+                        df_london["OR_Size"] <= df_london["OR_Size"].median(),
+                        "Small OR",
+                        "Large OR",
+                    )
+                    fig_l2 = px.box(
+                        df_london,
+                        x="OR_Category",
+                        y="Max_Extension",
+                        labels={
+                            "OR_Category": "London OR Classification",
+                            "Max_Extension": f"Post-OR Max Extension ({unit_label})",
+                        },
+                        title="Extension vs Reversion (London)",
+                    )
+                    st.plotly_chart(fig_l2, use_container_width=True)
+
+        # =========================================================
+        # NEW YORK SESSION TAB
+        # =========================================================
+        with tab_ny:
+            st.subheader("🇺🇸 New York Session Analysis")
+            col_n1, col_n2, col_n3 = st.columns(3)
+            ny_or_h = col_n1.selectbox(
+                "New York OR Start Hour (UTC)",
+                list(range(0, 24)),
+                index=13,
+                key="n_h",
+            )
+            ny_dur = col_n2.selectbox(
+                "New York OR Duration", [15, 30, 60, 120], index=2, key="n_d"
+            )
+            ny_end_h = col_n3.selectbox(
+                "New York Session End Hour (UTC)",
+                list(range(0, 24)),
+                index=21,
+                key="n_e",
             )
 
-            fig_box = px.box(
-                df_stats,
-                x="OR_Category",
-                y="Max_Extension",
-                labels={
-                    "OR_Category": "Opening Range Classification",
-                    "Max_Extension": f"Post-OR Max Extension ({unit_label})",
-                },
-                title="Post-OR Extension Magnitude: Small vs. Large Opening Ranges",
+            df_ny = run_session_analysis(
+                raw_df, ny_or_h, 0, ny_dur, ny_end_h, mult
             )
-            st.plotly_chart(fig_box, use_container_width=True)
 
-            # Reversion conclusion note
-            st.markdown(
-                "> **Key Takeaway Guidance:** If the correlation is close to 1.0, wider opening ranges reliably lead to expanded trending days. If max extensions flatten or drop proportionally for large ORs, price tends to exhibit exhaustion and reversion behavior."
-            )
+            if df_ny.empty:
+                st.info(
+                    "No data matched the New York session filters. Adjust hours or check timeframe."
+                )
+            else:
+                m1, m2, m3 = st.columns(3)
+                m1.metric(
+                    f"Avg OR Size ({unit_label})", f"{df_ny['OR_Size'].mean():.1f}"
+                )
+                m2.metric(
+                    f"Avg Session Range ({unit_label})",
+                    f"{df_ny['Session_Range'].mean():.1f}",
+                )
+                corr_n = df_ny["OR_Size"].corr(df_ny["Session_Range"])
+                m3.metric("OR Size vs Session Range Correlation", f"{corr_n:.2f}")
+
+                st.markdown("---")
+                c1, c2 = st.columns(2)
+                with c1:
+                    fig_n1 = px.scatter(
+                        df_ny,
+                        x="OR_Size",
+                        y="Session_Range",
+                        labels={
+                            "OR_Size": f"New York OR Size ({unit_label})",
+                            "Session_Range": f"New York Session Range ({unit_label})",
+                        },
+                        title="OR Size vs. Session Range (New York)",
+                    )
+                    st.plotly_chart(fig_n1, use_container_width=True)
+                with c2:
+                    df_ny["OR_Category"] = np.where(
+                        df_ny["OR_Size"] <= df_ny["OR_Size"].median(),
+                        "Small OR",
+                        "Large OR",
+                    )
+                    fig_n2 = px.box(
+                        df_ny,
+                        x="OR_Category",
+                        y="Max_Extension",
+                        labels={
+                            "OR_Category": "New York OR Classification",
+                            "Max_Extension": f"Post-OR Max Extension ({unit_label})",
+                        },
+                        title="Extension vs Reversion (New York)",
+                    )
+                    st.plotly_chart(fig_n2, use_container_width=True)
