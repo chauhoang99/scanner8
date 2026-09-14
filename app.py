@@ -13,7 +13,7 @@ st.set_page_config(
 
 st.title("🌐 Oanda Market Session Opening Range (OR) Dashboard")
 st.markdown(
-    "Analyze Opening Range sizes, post-OR extension magnitudes, and cross-session breakout vs. reversion probabilities."
+    "Analyze Opening Range sizes, post-OR extension magnitudes, and cross-session breakout vs. reversion probabilities (Optimized)."
 )
 
 # ---------------------------------------------------------
@@ -69,7 +69,7 @@ def get_pip_multiplier(ticker):
 
 
 # ---------------------------------------------------------
-# PAGINATED OANDA DATA FETCHING
+# FAST PAGINATED OANDA DATA FETCHING
 # ---------------------------------------------------------
 @st.cache_data(ttl=600)
 def fetch_oanda_m5_paginated(
@@ -91,7 +91,7 @@ def fetch_oanda_m5_paginated(
         params = {
             "price": "M",
             "granularity": "M5",
-            "count": 4000,
+            "count": 5000,  # Maximize chunk size to reduce API calls
             "to": to_time.isoformat(),
         }
         try:
@@ -112,7 +112,7 @@ def fetch_oanda_m5_paginated(
             if len(candles) < 10:
                 break
 
-            t_module.sleep(0.2)
+            t_module.sleep(0.05)  # Faster micro-pause
         except Exception:
             break
 
@@ -143,46 +143,46 @@ def fetch_oanda_m5_paginated(
 
 
 # ---------------------------------------------------------
-# SESSION PROCESSING LOGIC WITH PREVIOUS SESSION MAPPING
+# HIGHLY OPTIMIZED VECTORIZED SESSION ANALYSIS
 # ---------------------------------------------------------
+@st.cache_data(ttl=600)
 def run_session_analysis(
-    raw_df, or_start_h, or_start_m, or_dur_mins, sess_end_h, mult, session_type
+    raw_df_in, or_start_h, or_start_m, or_dur_mins, sess_end_h, mult, session_type
 ):
-    if raw_df is None or raw_df.empty:
+    if raw_df_in is None or raw_df_in.empty:
         return pd.DataFrame()
 
-    if raw_df.index.tz is None:
-        raw_df.index = pd.to_datetime(raw_df.index, utc=True)
+    df = raw_df_in.copy()
+    if df.index.tz is None:
+        df.index = pd.to_datetime(df.index, utc=True)
     else:
-        raw_df.index = raw_df.index.tz_convert("UTC")
+        df.index = df.index.tz_convert("UTC")
 
-    # Helper to get session high/low for a given window on a specific date
-    def get_session_bounds(df_full, d, start_h, end_h):
-        mask = (df_full.index.date == d) & (
-            df_full.index.time >= time(start_h, 0)
-        ) & (df_full.index.time <= time(end_h, 0))
-        sub = df_full[mask]
-        if sub.empty:
-            return None, None
-        return float(sub["High"].max()), float(sub["Low"].min())
+    df["Date"] = df.index.date
+    df["Hour"] = df.index.hour
 
-    raw_df["Date"] = raw_df.index.date
-    unique_dates = sorted(raw_df["Date"].unique())
+    # Fast Vectorized Pre-calculation of Session Extremes across all dates
+    def assign_session(h):
+        if 0 <= h < 8:
+            return "Tokyo"
+        elif 8 <= h < 16:
+            return "London"
+        elif 13 <= h < 21:
+            return "NY"
+        return "Other"
 
-    # Pre-calculate standard session high/low for all dates to easily find "previous session"
-    session_extremes = {}
-    for d in unique_dates:
-        # Define standard block windows for Tokyo (0-8), London (8-16), NY (13-21)
-        t_h, t_l = get_session_bounds(raw_df, d, 0, 8)
-        l_h, l_l = get_session_bounds(raw_df, d, 8, 16)
-        n_h, n_l = get_session_bounds(raw_df, d, 13, 21)
-        session_extremes[d] = {
-            "Tokyo": (t_h, t_l),
-            "London": (l_h, l_l),
-            "NY": (n_h, n_l),
-        }
+    df["Session_Name"] = df["Hour"].apply(assign_session)
 
-    grouped = raw_df.groupby("Date")
+    # Single-pass groupby to get high/low for Tokyo, London, NY for every date
+    extremes_pivot = (
+        df[df["Session_Name"] != "Other"]
+        .groupby(["Date", "Session_Name"])
+        .agg({"High": "max", "Low": "min"})
+        .unstack(level="Session_Name")
+    )
+
+    unique_dates = sorted(df["Date"].unique())
+    grouped = df.groupby("Date")
     analysis_results = []
 
     or_start_time = time(or_start_h, or_start_m)
@@ -227,19 +227,23 @@ def run_session_analysis(
         close_price = float(sess_df["Close"].iloc[-1])
         dist_from_mid_close = abs(close_price - or_mid) * mult
 
-        # Determine Previous Session High / Low
+        # Instant lookup from pre-computed pivot table
         prev_h, prev_l = None, None
-        if session_type == "Tokyo":
-            if i > 0:
+        try:
+            if session_type == "Tokyo" and i > 0:
                 prev_date = unique_dates[i - 1]
-                prev_h, prev_l = session_extremes[prev_date]["NY"]
-        elif session_type == "London":
-            prev_h, prev_l = session_extremes[date_val]["Tokyo"]
-        elif session_type == "New York":
-            prev_h, prev_l = session_extremes[date_val]["London"]
+                prev_h = extremes_pivot.loc[prev_date, ("High", "NY")]
+                prev_l = extremes_pivot.loc[prev_date, ("Low", "NY")]
+            elif session_type == "London":
+                prev_h = extremes_pivot.loc[date_val, ("High", "Tokyo")]
+                prev_l = extremes_pivot.loc[date_val, ("Low", "Tokyo")]
+            elif session_type == "New York":
+                prev_h = extremes_pivot.loc[date_val, ("High", "London")]
+                prev_l = extremes_pivot.loc[date_val, ("Low", "London")]
+        except KeyError:
+            pass
 
-        # Reversion vs Sustained Breakout based on Previous Session High/Low
-        if prev_h is not None and prev_l is not None:
+        if prev_h is not None and not np.isnan(prev_h) and prev_l is not None and not np.isnan(prev_l):
             is_closed_back_in_prev = (close_price >= prev_l) & (
                 close_price <= prev_h
             )
