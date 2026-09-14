@@ -13,7 +13,7 @@ st.set_page_config(
 
 st.title("🌐 Oanda Market Session Opening Range (OR) Dashboard")
 st.markdown(
-    "Analyze Opening Range sizes, post-OR extension magnitudes, and cross-session breakout vs. reversion probabilities (Optimized)."
+    "Analyze Opening Range sizes, post-OR extension magnitudes, and breakout vs. reversion probabilities relative to the previous day's OR."
 )
 
 # ---------------------------------------------------------
@@ -91,7 +91,7 @@ def fetch_oanda_m5_paginated(
         params = {
             "price": "M",
             "granularity": "M5",
-            "count": 5000,  # Maximize chunk size to reduce API calls
+            "count": 5000,
             "to": to_time.isoformat(),
         }
         try:
@@ -112,7 +112,7 @@ def fetch_oanda_m5_paginated(
             if len(candles) < 10:
                 break
 
-            t_module.sleep(0.05)  # Faster micro-pause
+            t_module.sleep(0.05)
         except Exception:
             break
 
@@ -161,7 +161,6 @@ def run_session_analysis(
     df["Date"] = df.index.date
     df["Hour"] = df.index.hour
 
-    # Fast Vectorized Pre-calculation of Session Extremes across all dates
     def assign_session(h):
         if 0 <= h < 8:
             return "Tokyo"
@@ -173,7 +172,6 @@ def run_session_analysis(
 
     df["Session_Name"] = df["Hour"].apply(assign_session)
 
-    # Single-pass groupby to get high/low for Tokyo, London, NY for every date
     extremes_pivot = (
         df[df["Session_Name"] != "Other"]
         .groupby(["Date", "Session_Name"])
@@ -227,7 +225,7 @@ def run_session_analysis(
         close_price = float(sess_df["Close"].iloc[-1])
         dist_from_mid_close = abs(close_price - or_mid) * mult
 
-        # Instant lookup from pre-computed pivot table
+        # Instant lookup for previous session bounds
         prev_h, prev_l = None, None
         try:
             if session_type == "Tokyo" and i > 0:
@@ -266,7 +264,15 @@ def run_session_analysis(
             }
         )
 
-    return pd.DataFrame(analysis_results)
+    res_df = pd.DataFrame(analysis_results)
+    if not res_df.empty:
+        # Compare each day's OR_Size directly against the previous day's OR_Size
+        res_df["Prev_OR_Size"] = res_df["OR_Size"].shift(1)
+        res_df = res_df.dropna(subset=["Prev_OR_Size"])
+        res_df["OR_Category"] = np.where(
+            res_df["OR_Size"] <= res_df["Prev_OR_Size"], "Small OR", "Large OR"
+        )
+    return res_df
 
 
 # ---------------------------------------------------------
@@ -339,13 +345,8 @@ else:
             corr = df_sess["OR_Size"].corr(df_sess["Session_Range"])
             m3.metric("OR Size vs Session Range Correlation", f"{corr:.2f}")
 
-            median_cutoff = df_sess["OR_Size"].median()
             st.caption(
-                f"📊 **Benchmark Cutoff:** Median OR size is **{median_cutoff:.1f} {unit_label}**. Days below median are classified as 'Small OR'."
-            )
-
-            df_sess["OR_Category"] = np.where(
-                df_sess["OR_Size"] <= median_cutoff, "Small OR", "Large OR"
+                "📊 **Comparison Benchmark:** Each day's OR size is compared directly against the **previous day's OR size** (Smaller = Small OR, Larger = Large OR)."
             )
 
             st.markdown("---")
