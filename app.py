@@ -293,7 +293,6 @@ else:
                 df_stats,
                 x="OR_Size",
                 y="Session_Range",
-                trendline="ols",
                 labels={
                     "OR_Size": f"Opening Range Size ({unit_label})",
                     "Session_Range": f"Session Range ({unit_label})",
